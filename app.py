@@ -22,7 +22,7 @@ def require_token(x_auth_token: Optional[str]):
 
 @app.get("/ping")
 async def ping():
-    return {"ok": True}
+    return {"ok": True, "version": "1.2.0-concurrency-fix"}
 
 @app.get("/status")
 async def status(x_auth_token: Optional[str] = Header(default=None)):
