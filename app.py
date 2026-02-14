@@ -20,14 +20,19 @@ def require_token(x_auth_token: Optional[str]):
     if x_auth_token != TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+# Allow any token to define a session (Multi-tenant / Room logic)
+# BRIDGE_TOKEN env var is now optional, or checking could be added back for restricting creation 
+# But for this use case, we want dynamic channels.
+
 @app.get("/ping")
 async def ping():
-    return {"ok": True, "version": "1.3.0-browser-control"}
+    return {"ok": True, "version": "1.4.0-multi-channel"}
 
 @app.get("/status")
 async def status(x_auth_token: Optional[str] = Header(default=None)):
-    require_token(x_auth_token)
-    return {"agent_connected": TOKEN in agents}
+    if not x_auth_token:
+        return {"error": "missing_token"}
+    return {"agent_connected": x_auth_token in agents, "session": x_auth_token}
 
 
 # token -> Future for the pending request response
@@ -36,19 +41,22 @@ response_futures: Dict[str, asyncio.Future] = {}
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    # simple handshake: first message must be the token
+    # Handshake: Client sends their Token (Room ID)
     try:
         token_msg = await asyncio.wait_for(ws.receive_text(), timeout=10)
     except Exception:
         await ws.close(code=1008)
         return
 
-    if TOKEN and token_msg != TOKEN:
+    if not token_msg:
         await ws.close(code=1008)
         return
-
-    agents[TOKEN] = ws
-    locks.setdefault(TOKEN, asyncio.Lock())
+        
+    session_token = token_msg
+    agents[session_token] = ws
+    locks.setdefault(session_token, asyncio.Lock())
+    
+    print(f"Agent connected to session: {session_token}")
 
     try:
         while True:
@@ -57,21 +65,20 @@ async def ws_endpoint(ws: WebSocket):
             
             if message["type"] == "websocket.disconnect":
                 break
-                
+            
             data = None
             if "text" in message:
                 text_data = message["text"]
                 if text_data == "ping":
                     await ws.send_text("pong")
                     continue
-                # If agent sends text, treat as data
                 data = text_data.encode("utf-8")
             elif "bytes" in message:
                 data = message["bytes"]
             
-            # If we have a pending request, deliver the data
+            # Deliver data to the specific session's future
             if data is not None:
-                fut = response_futures.get(TOKEN)
+                fut = response_futures.get(session_token)
                 if fut and not fut.done():
                     fut.set_result(data)
                 
@@ -80,26 +87,29 @@ async def ws_endpoint(ws: WebSocket):
     except Exception as e:
         print(f"WS Error: {e}")
     finally:
-        if agents.get(TOKEN) is ws:
-            agents.pop(TOKEN, None)
-            # Cancel any pending future if disconnected
-            fut = response_futures.get(TOKEN)
+        if agents.get(session_token) is ws:
+            agents.pop(session_token, None)
+            # Cancel future
+            fut = response_futures.get(session_token)
             if fut and not fut.done():
                 fut.cancel()
-            response_futures.pop(TOKEN, None)
+            response_futures.pop(session_token, None)
+        print(f"Agent disconnected from session: {session_token}")
 
-async def agent_call(command: str, payload: Optional[bytes] = None) -> bytes:
-    if TOKEN not in agents:
+async def agent_call(command: str, payload: Optional[bytes] = None, session_token: str = "") -> bytes:
+    if not session_token:
+        raise HTTPException(status_code=400, detail="missing_session_token")
+    if session_token not in agents:
         raise HTTPException(status_code=503, detail="agent_not_connected")
 
-    ws = agents[TOKEN]
-    lock = locks[TOKEN]
+    ws = agents[session_token]
+    lock = locks[session_token]
 
     async with lock:
         # Register future for response
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        response_futures[TOKEN] = fut
+        response_futures[session_token] = fut
         
         try:
             await ws.send_text(command)
@@ -109,38 +119,40 @@ async def agent_call(command: str, payload: Optional[bytes] = None) -> bytes:
             # Wait for response from the centralized reader
             data = await asyncio.wait_for(fut, timeout=120)
             return data
+        except asyncio.TimeoutError:
+             raise HTTPException(status_code=504, detail="agent_timeout")
         except Exception as e:
             raise HTTPException(status_code=504, detail=f"agent_error:{e}")
         finally:
             # Clean up
-            if response_futures.get(TOKEN) == fut:
-                response_futures.pop(TOKEN, None)
+            if response_futures.get(session_token) == fut:
+                response_futures.pop(session_token, None)
 
 
 @app.get("/list")
 async def list_files(x_auth_token: Optional[str] = Header(default=None)):
-    require_token(x_auth_token)
-    data = await agent_call("LIST")
+    if not x_auth_token: raise HTTPException(status_code=401, detail="missing_token")
+    data = await agent_call("LIST", session_token=x_auth_token)
     # data is utf-8 JSON
     return JSONResponse(content=json_loads_safe(data))
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), x_auth_token: Optional[str] = Header(default=None)):
-    require_token(x_auth_token)
+    if not x_auth_token: raise HTTPException(status_code=401, detail="missing_token")
     content = await file.read()
     if len(content) > MAX_BYTES:
         raise HTTPException(status_code=413, detail=f"file_too_large_max_{MAX_BYTES}")
     # payload format: filename\n + bytes
     payload = (file.filename + "\n").encode("utf-8") + content
-    resp = await agent_call("PUT", payload)
+    resp = await agent_call("PUT", payload, session_token=x_auth_token)
     return JSONResponse(content=json_loads_safe(resp))
 
 @app.get("/download/{filename}")
 async def download_file(filename: str, x_auth_token: Optional[str] = Header(default=None)):
-    require_token(x_auth_token)
+    if not x_auth_token: raise HTTPException(status_code=401, detail="missing_token")
     if len(filename) > 255:
         raise HTTPException(status_code=400, detail="bad_filename")
-    resp = await agent_call("GET", filename.encode("utf-8"))
+    resp = await agent_call("GET", filename.encode("utf-8"), session_token=x_auth_token)
     # resp format: first line is json header, then raw bytes after \n\n
     header, sep, body = resp.partition(b"\n\n")
     meta = json_loads_safe(header)
@@ -159,12 +171,12 @@ async def execute_command(
     command: Dict = settings_Body(...), 
     x_auth_token: Optional[str] = Header(default=None)
 ):
-    require_token(x_auth_token)
+    if not x_auth_token: raise HTTPException(status_code=401, detail="missing_token")
     import json
     # Send "EXECUTE" and the JSON payload string
     # The agent must handle "EXECUTE"
     payload = json.dumps(command).encode("utf-8")
-    resp_bytes = await agent_call("EXECUTE", payload)
+    resp_bytes = await agent_call("EXECUTE", payload, session_token=x_auth_token)
     return JSONResponse(content=json_loads_safe(resp_bytes))
 
 def json_loads_safe(b: bytes):
