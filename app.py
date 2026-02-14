@@ -1,7 +1,7 @@
 import os
 import asyncio
 from typing import Dict, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, Header, Body as settings_Body
 from fastapi.responses import StreamingResponse, JSONResponse
 
 TOKEN = os.environ.get("BRIDGE_TOKEN", "")  # set this in Render
@@ -22,7 +22,7 @@ def require_token(x_auth_token: Optional[str]):
 
 @app.get("/ping")
 async def ping():
-    return {"ok": True, "version": "1.2.0-concurrency-fix"}
+    return {"ok": True, "version": "1.3.0-browser-control"}
 
 @app.get("/status")
 async def status(x_auth_token: Optional[str] = Header(default=None)):
@@ -153,6 +153,19 @@ async def download_file(filename: str, x_auth_token: Optional[str] = Header(defa
 
     return StreamingResponse(gen(), media_type="application/octet-stream",
                              headers={"Content-Disposition": f'attachment; filename="{out_name}"'})
+
+@app.post("/execute")
+async def execute_command(
+    command: Dict = settings_Body(...), 
+    x_auth_token: Optional[str] = Header(default=None)
+):
+    require_token(x_auth_token)
+    import json
+    # Send "EXECUTE" and the JSON payload string
+    # The agent must handle "EXECUTE"
+    payload = json.dumps(command).encode("utf-8")
+    resp_bytes = await agent_call("EXECUTE", payload)
+    return JSONResponse(content=json_loads_safe(resp_bytes))
 
 def json_loads_safe(b: bytes):
     import json
