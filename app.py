@@ -29,6 +29,10 @@ async def status(x_auth_token: Optional[str] = Header(default=None)):
     require_token(x_auth_token)
     return {"agent_connected": TOKEN in agents}
 
+
+# token -> Future for the pending request response
+response_futures: Dict[str, asyncio.Future] = {}
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -47,16 +51,42 @@ async def ws_endpoint(ws: WebSocket):
     locks.setdefault(TOKEN, asyncio.Lock())
 
     try:
-        # keep alive: just wait for disconnect; agent can also send "pong"
         while True:
-            msg = await ws.receive_text()
-            if msg == "ping":
-                await ws.send_text("pong")
+            # Centralized reading loop
+            message = await ws.receive()
+            
+            if message["type"] == "websocket.disconnect":
+                break
+                
+            data = None
+            if "text" in message:
+                text_data = message["text"]
+                if text_data == "ping":
+                    await ws.send_text("pong")
+                    continue
+                # If agent sends text, treat as data
+                data = text_data.encode("utf-8")
+            elif "bytes" in message:
+                data = message["bytes"]
+            
+            # If we have a pending request, deliver the data
+            if data is not None:
+                fut = response_futures.get(TOKEN)
+                if fut and not fut.done():
+                    fut.set_result(data)
+                
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        print(f"WS Error: {e}")
     finally:
         if agents.get(TOKEN) is ws:
             agents.pop(TOKEN, None)
+            # Cancel any pending future if disconnected
+            fut = response_futures.get(TOKEN)
+            if fut and not fut.done():
+                fut.cancel()
+            response_futures.pop(TOKEN, None)
 
 async def agent_call(command: str, payload: Optional[bytes] = None) -> bytes:
     if TOKEN not in agents:
@@ -66,15 +96,26 @@ async def agent_call(command: str, payload: Optional[bytes] = None) -> bytes:
     lock = locks[TOKEN]
 
     async with lock:
-        await ws.send_text(command)
-        if payload is not None:
-            await ws.send_bytes(payload)
-        # response: bytes (first frame) and optional second frame (not used)
+        # Register future for response
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        response_futures[TOKEN] = fut
+        
         try:
-            data = await asyncio.wait_for(ws.receive_bytes(), timeout=120)
+            await ws.send_text(command)
+            if payload is not None:
+                await ws.send_bytes(payload)
+            
+            # Wait for response from the centralized reader
+            data = await asyncio.wait_for(fut, timeout=120)
+            return data
         except Exception as e:
-            raise HTTPException(status_code=504, detail=f"agent_timeout:{e}")
-        return data
+            raise HTTPException(status_code=504, detail=f"agent_error:{e}")
+        finally:
+            # Clean up
+            if response_futures.get(TOKEN) == fut:
+                response_futures.pop(TOKEN, None)
+
 
 @app.get("/list")
 async def list_files(x_auth_token: Optional[str] = Header(default=None)):
