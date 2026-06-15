@@ -5,7 +5,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, H
 from fastapi.responses import StreamingResponse, JSONResponse
 
 TOKEN = os.environ.get("BRIDGE_TOKEN", "")  # set this in Render
-MAX_BYTES = int(os.environ.get("MAX_BYTES", str(25 * 1024 * 1024)))  # 25 MB default
+MAX_BYTES = int(os.environ.get("MAX_BYTES", str(2 * 1024 * 1024 * 1024)))  # 2 GB default
 
 app = FastAPI(title="File Bridge Relay")
 
